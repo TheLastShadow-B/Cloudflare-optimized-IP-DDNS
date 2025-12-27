@@ -18,12 +18,20 @@ import subprocess
 import platform
 import re
 import socket
+import struct
 import requests
 import logging
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
+
+# 尝试导入 dnspython，如果没有则使用 nslookup 命令
+try:
+    import dns.resolver
+    HAS_DNSPYTHON = True
+except ImportError:
+    HAS_DNSPYTHON = False
 
 # 脚本所在目录
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -51,6 +59,9 @@ API_URL=https://vps789.com/public/sum/cfIpTop20
 # [可选] 丢包率筛选阈值，低于此值的域名才会被解析（默认: 0.5）
 PKG_LOST_THRESHOLD=0.5
 
+# [可选] DNS 服务器列表，用逗号分隔（默认: 119.29.29.29,223.5.5.5）
+DNS_SERVERS=119.29.29.29,223.5.5.5
+
 # [可选] 是否跳过本地 ping 测试，直接使用 API 数据（true/false，默认: false）
 SKIP_PING=false
 
@@ -68,6 +79,9 @@ logger = logging.getLogger(__name__)
 # 默认丢包率筛选阈值
 DEFAULT_PKG_LOST_THRESHOLD = 0.5
 
+# 默认 DNS 服务器列表
+DEFAULT_DNS_SERVERS = ['119.29.29.29', '223.5.5.5']
+
 
 @dataclass
 class Config:
@@ -78,6 +92,7 @@ class Config:
     ping_workers: int = 5
     api_url: str = "https://vps789.com/public/sum/cfIpTop20"
     pkg_lost_threshold: float = DEFAULT_PKG_LOST_THRESHOLD
+    dns_servers: list[str] = field(default_factory=lambda: DEFAULT_DNS_SERVERS.copy())
     skip_ping: bool = False
     debug: bool = False
 
@@ -206,6 +221,15 @@ def load_config() -> Optional[Config]:
         except ValueError:
             return default
 
+    def parse_list(value: str, default: list) -> list:
+        if not value:
+            return default
+        return [item.strip() for item in value.split(',') if item.strip()]
+
+    # 解析 DNS 服务器列表
+    dns_servers_str = env_vars.get('DNS_SERVERS', '').strip()
+    dns_servers = parse_list(dns_servers_str, DEFAULT_DNS_SERVERS.copy())
+
     config = Config(
         hostname=hostname,
         password=password,
@@ -213,6 +237,7 @@ def load_config() -> Optional[Config]:
         ping_workers=parse_int(env_vars.get('PING_WORKERS', ''), 5),
         api_url=env_vars.get('API_URL', '').strip() or "https://vps789.com/public/sum/cfIpTop20",
         pkg_lost_threshold=parse_float(env_vars.get('PKG_LOST_THRESHOLD', ''), DEFAULT_PKG_LOST_THRESHOLD),
+        dns_servers=dns_servers,
         skip_ping=parse_bool(env_vars.get('SKIP_PING', ''), False),
         debug=parse_bool(env_vars.get('DEBUG', ''), False),
     )
@@ -259,13 +284,15 @@ def fetch_top_domains(url: str) -> list[DomainInfo]:
         raise
 
 
-def filter_and_resolve_domains(domains: list[DomainInfo], threshold: float) -> dict[str, list[str]]:
+def filter_and_resolve_domains(domains: list[DomainInfo], threshold: float,
+                                dns_servers: list[str]) -> dict[str, list[str]]:
     """
-    筛选丢包率低于阈值的域名，并解析为 IP，合并去重
+    筛选丢包率低于阈值的域名，并通过多个 DNS 服务器解析为 IP，合并去重
 
     Args:
         domains: 域名信息列表
         threshold: 丢包率阈值
+        dns_servers: DNS 服务器列表
 
     Returns:
         IP 到来源域名列表的映射 {ip: [domain1, domain2, ...]}
@@ -281,35 +308,167 @@ def filter_and_resolve_domains(domains: list[DomainInfo], threshold: float) -> d
     # 解析所有域名的 IP 并去重
     ip_to_domains: dict[str, list[str]] = {}
 
+    logger.info(f"使用 DNS 服务器: {', '.join(dns_servers)}")
+
     for d in filtered_domains:
-        ip = resolve_domain(d.domain)
-        if ip:
+        # 通过多个 DNS 服务器解析，获取所有 IP
+        ips = resolve_domain_all_ips(d.domain, dns_servers)
+        for ip in ips:
             if ip not in ip_to_domains:
                 ip_to_domains[ip] = []
-            ip_to_domains[ip].append(d.domain)
+            if d.domain not in ip_to_domains[ip]:
+                ip_to_domains[ip].append(d.domain)
 
     logger.info(f"解析得到 {len(ip_to_domains)} 个不重复 IP")
 
     return ip_to_domains
 
 
-def resolve_domain(domain: str) -> Optional[str]:
+def resolve_domain_all_ips(domain: str, dns_servers: list[str]) -> list[str]:
     """
-    解析域名获取 IP 地址
+    通过多个 DNS 服务器解析域名，获取所有 IP 地址
 
     Args:
         domain: 域名
+        dns_servers: DNS 服务器列表
 
     Returns:
-        IP 地址，解析失败返回 None
+        去重后的 IP 地址列表
     """
+    all_ips: set[str] = set()
+
+    # 1. 首先使用系统默认 DNS 解析（获取所有 A 记录）
     try:
-        ip = socket.gethostbyname(domain)
-        logger.debug(f"域名 {domain} 解析为 IP: {ip}")
-        return ip
+        # 使用 getaddrinfo 获取所有 IP
+        results = socket.getaddrinfo(domain, None, socket.AF_INET)
+        for result in results:
+            ip = result[4][0]
+            all_ips.add(ip)
+            logger.debug(f"系统 DNS 解析 {domain} -> {ip}")
     except socket.gaierror as e:
-        logger.debug(f"解析域名 {domain} 失败: {e}")
-        return None
+        logger.debug(f"系统 DNS 解析 {domain} 失败: {e}")
+
+    # 2. 通过指定的 DNS 服务器解析
+    for dns_server in dns_servers:
+        ips = resolve_with_dns_server(domain, dns_server)
+        for ip in ips:
+            if ip not in all_ips:
+                logger.debug(f"DNS {dns_server} 解析 {domain} -> {ip}")
+            all_ips.add(ip)
+
+    if all_ips:
+        logger.debug(f"域名 {domain} 共解析到 {len(all_ips)} 个 IP: {', '.join(all_ips)}")
+    else:
+        logger.warning(f"域名 {domain} 解析失败，未获取到任何 IP")
+
+    return list(all_ips)
+
+
+def resolve_with_dns_server(domain: str, dns_server: str, timeout: float = 5.0) -> list[str]:
+    """
+    使用指定的 DNS 服务器解析域名
+
+    Args:
+        domain: 域名
+        dns_server: DNS 服务器地址
+        timeout: 超时时间（秒）
+
+    Returns:
+        IP 地址列表
+    """
+    ips = []
+
+    if HAS_DNSPYTHON:
+        # 使用 dnspython 库
+        try:
+            resolver = dns.resolver.Resolver()
+            resolver.nameservers = [dns_server]
+            resolver.timeout = timeout
+            resolver.lifetime = timeout
+
+            answers = resolver.resolve(domain, 'A')
+            for rdata in answers:
+                ips.append(str(rdata))
+        except Exception as e:
+            logger.debug(f"dnspython 通过 {dns_server} 解析 {domain} 失败: {e}")
+    else:
+        # 使用 nslookup 命令
+        ips = resolve_with_nslookup(domain, dns_server, timeout)
+
+    return ips
+
+
+def resolve_with_nslookup(domain: str, dns_server: str, timeout: float = 5.0) -> list[str]:
+    """
+    使用 nslookup 命令解析域名
+
+    Args:
+        domain: 域名
+        dns_server: DNS 服务器地址
+        timeout: 超时时间（秒）
+
+    Returns:
+        IP 地址列表
+    """
+    ips = []
+    system = platform.system().lower()
+
+    try:
+        if system == 'windows':
+            cmd = ['nslookup', domain, dns_server]
+        else:
+            # Linux/macOS
+            cmd = ['nslookup', domain, dns_server]
+
+        process = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+
+        output = process.stdout
+
+        # 解析 nslookup 输出，提取 IP 地址
+        # 跳过 DNS 服务器自身的地址，只提取解析结果
+        lines = output.split('\n')
+        in_answer_section = False
+
+        for line in lines:
+            line = line.strip()
+            # 检测到 "Name:" 或 "名称:" 后开始解析
+            if 'Name:' in line or '名称:' in line or 'name =' in line.lower():
+                in_answer_section = True
+                continue
+
+            if in_answer_section:
+                # 提取 Address: 或 地址: 后面的 IP
+                if 'Address:' in line or '地址:' in line or 'address' in line.lower():
+                    # 提取 IPv4 地址
+                    ip_match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', line)
+                    if ip_match:
+                        ip = ip_match.group(1)
+                        # 排除 DNS 服务器自身的地址
+                        if ip != dns_server:
+                            ips.append(ip)
+
+        # 如果上面的方法没有提取到，尝试直接从输出中提取所有 IPv4 地址
+        if not ips:
+            # 查找所有 IPv4 地址
+            all_ips = re.findall(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', output)
+            # 排除 DNS 服务器地址和常见的本地地址
+            for ip in all_ips:
+                if ip != dns_server and not ip.startswith('127.') and ip not in ips:
+                    ips.append(ip)
+
+    except subprocess.TimeoutExpired:
+        logger.debug(f"nslookup {domain} @{dns_server} 超时")
+    except FileNotFoundError:
+        logger.debug("找不到 nslookup 命令")
+    except Exception as e:
+        logger.debug(f"nslookup 解析失败: {e}")
+
+    return ips
 
 
 def ping_ip(ip: str, count: int = 100, timeout: int = 5) -> PingResult:
@@ -557,6 +716,7 @@ def main() -> int:
 
     logger.info(f"目标主机名: {config.hostname}")
     logger.info(f"丢包率筛选阈值: {config.pkg_lost_threshold}%")
+    logger.info(f"DNS 服务器: {', '.join(config.dns_servers)}")
 
     try:
         # 2. 获取域名列表
@@ -566,8 +726,10 @@ def main() -> int:
             logger.error("未获取到任何域名")
             return 1
 
-        # 3. 筛选域名并解析 IP
-        ip_to_domains = filter_and_resolve_domains(domains, config.pkg_lost_threshold)
+        # 3. 筛选域名并解析 IP（使用多个 DNS 服务器）
+        ip_to_domains = filter_and_resolve_domains(
+            domains, config.pkg_lost_threshold, config.dns_servers
+        )
 
         if not ip_to_domains:
             logger.error("没有可解析的 IP")
