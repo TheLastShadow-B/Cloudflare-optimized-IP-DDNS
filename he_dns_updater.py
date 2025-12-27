@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-HE.net DNS A 记录自动更新工具（负载均衡版）
+HE.net DNS A 记录自动更新工具
 
 从 vps789.com 获取 Cloudflare 优化 IP 的 Top 20 域名，
-筛选丢包率低于 0.5% 的域名，解析所有 IP 并去重，
-对 IP 进行 ping 测试后选择最佳的 3 个 IP 更新 dns.he.net 的 A 记录。
-多个 A 记录实现 DNS 轮询负载均衡。
-
-注意：dns.he.net 不支持通过 API 删除/创建记录，只能更新已有的动态 A 记录。
-请先在 dns.he.net 控制面板创建 3 个相同主机名的 A 记录并启用动态 DNS，获取各自的密钥。
+筛选丢包率低于阈值的域名，解析所有 IP 并去重，
+对 IP 进行 ping 测试后选择最佳的 1 个 IP 更新 dns.he.net 的 A 记录。
 
 配置文件: .env（与脚本同目录）
 运行方式: python he_dns_updater.py（无需任何参数）
@@ -17,7 +13,6 @@ HE.net DNS A 记录自动更新工具（负载均衡版）
 日期: 2025-12-27
 """
 
-import os
 import sys
 import subprocess
 import platform
@@ -35,21 +30,14 @@ SCRIPT_DIR = Path(__file__).parent.absolute()
 ENV_FILE = SCRIPT_DIR / '.env'
 
 # .env 文件模板
-ENV_TEMPLATE = """# HE.net DNS 自动更新工具配置文件（负载均衡版）
+ENV_TEMPLATE = """# HE.net DNS 自动更新工具配置文件
 # 请填写以下配置项后保存
-#
-# 使用说明：
-# 1. 在 dns.he.net 控制面板为同一个主机名创建 3 个 A 记录
-# 2. 分别启用动态 DNS 并生成密钥
-# 3. 将主机名和 3 个密钥填写到下面的配置中
 
 # [必填] dns.he.net 上要更新的主机名（如: cdn.example.com）
-# 注意：3 个 A 记录使用相同的主机名
 HE_HOSTNAME=
 
-# [必填] 3 个动态 DNS 密钥（在 dns.he.net 控制面板为每个 A 记录分别生成）
-# 用英文逗号分隔，例如: key1,key2,key3
-HE_PASSWORDS=
+# [必填] dns.he.net 动态 DNS 密钥
+HE_PASSWORD=
 
 # [可选] 每个 IP 的 ping 次数（默认: 100）
 PING_COUNT=100
@@ -77,9 +65,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 负载均衡 A 记录数量
-NUM_RECORDS = 3
-
 # 默认丢包率筛选阈值
 DEFAULT_PKG_LOST_THRESHOLD = 0.5
 
@@ -88,7 +73,7 @@ DEFAULT_PKG_LOST_THRESHOLD = 0.5
 class Config:
     """配置类"""
     hostname: str
-    passwords: list[str] = field(default_factory=list)
+    password: str
     ping_count: int = 100
     ping_workers: int = 5
     api_url: str = "https://vps789.com/public/sum/cfIpTop20"
@@ -187,20 +172,15 @@ def load_config() -> Optional[Config]:
 
     # 检查必填项
     hostname = env_vars.get('HE_HOSTNAME', '').strip()
-    passwords_str = env_vars.get('HE_PASSWORDS', '').strip()
-
-    # 解析密钥列表
-    passwords = [p.strip() for p in passwords_str.split(',') if p.strip()]
+    password = env_vars.get('HE_PASSWORD', '').strip()
 
     if not hostname:
         logger.error("配置文件缺少必填项: HE_HOSTNAME 未填写")
         logger.error(f"请编辑配置文件: {ENV_FILE}")
         return None
 
-    if len(passwords) < NUM_RECORDS:
-        logger.error(f"配置文件缺少必填项: HE_PASSWORDS 需要 {NUM_RECORDS} 个密钥")
-        logger.error(f"当前配置了 {len(passwords)} 个密钥，需要 {NUM_RECORDS} 个")
-        logger.error("请在 dns.he.net 为同一主机名创建 3 个 A 记录并获取密钥")
+    if not password:
+        logger.error("配置文件缺少必填项: HE_PASSWORD 未填写")
         logger.error(f"请编辑配置文件: {ENV_FILE}")
         return None
 
@@ -228,7 +208,7 @@ def load_config() -> Optional[Config]:
 
     config = Config(
         hostname=hostname,
-        passwords=passwords[:NUM_RECORDS],  # 只取前 3 个
+        password=password,
         ping_count=parse_int(env_vars.get('PING_COUNT', ''), 100),
         ping_workers=parse_int(env_vars.get('PING_WORKERS', ''), 5),
         api_url=env_vars.get('API_URL', '').strip() or "https://vps789.com/public/sum/cfIpTop20",
@@ -475,24 +455,23 @@ def test_all_ips(ip_to_domains: dict[str, list[str]], ping_count: int = 100,
     return results
 
 
-def select_best_ips(results: list[PingResult], count: int = NUM_RECORDS) -> list[PingResult]:
+def select_best_ip(results: list[PingResult]) -> Optional[PingResult]:
     """
-    选择最佳的多个 IP
+    选择最佳的 IP
     优先考虑丢包率，其次考虑平均延迟
 
     Args:
         results: ping 测试结果列表
-        count: 需要选择的 IP 数量
 
     Returns:
-        最佳 IP 的测试结果列表
+        最佳 IP 的测试结果，如果没有可用 IP 返回 None
     """
     # 过滤成功的结果
     valid_results = [r for r in results if r.success]
 
     if not valid_results:
         logger.error("没有可用的 IP")
-        return []
+        return None
 
     # 按丢包率和延迟排序
     sorted_results = sorted(
@@ -500,28 +479,25 @@ def select_best_ips(results: list[PingResult], count: int = NUM_RECORDS) -> list
         key=lambda x: (x.packet_loss, x.avg_latency)
     )
 
-    # 取前 count 个
-    best_results = sorted_results[:count]
-
-    if len(best_results) < count:
-        logger.warning(f"只找到 {len(best_results)} 个可用 IP（需要 {count} 个）")
+    best = sorted_results[0]
 
     # 输出结果
     logger.info(f"\n{'='*60}")
-    logger.info(f"已选择最佳的 {len(best_results)} 个 IP（用于负载均衡）:")
-    for i, r in enumerate(best_results, 1):
-        domains_str = ', '.join(r.source_domains[:2])
-        if len(r.source_domains) > 2:
-            domains_str += f" 等 {len(r.source_domains)} 个域名"
-        logger.info(f"  [{i}] {r.ip}")
-        logger.info(f"      来源: {domains_str}")
-        logger.info(f"      丢包率: {r.packet_loss:.1f}%, 平均延迟: {r.avg_latency:.1f}ms")
+    logger.info(f"最佳 IP: {best.ip}")
+    domains_str = ', '.join(best.source_domains[:3])
+    if len(best.source_domains) > 3:
+        domains_str += f" 等 {len(best.source_domains)} 个域名"
+    logger.info(f"  来源: {domains_str}")
+    logger.info(f"  丢包率: {best.packet_loss:.1f}%")
+    logger.info(f"  平均延迟: {best.avg_latency:.1f}ms")
+    logger.info(f"  最小延迟: {best.min_latency:.1f}ms")
+    logger.info(f"  最大延迟: {best.max_latency:.1f}ms")
     logger.info(f"{'='*60}")
 
-    return best_results
+    return best
 
 
-def update_he_dns(hostname: str, password: str, ip: str, record_index: int) -> bool:
+def update_he_dns(hostname: str, password: str, ip: str) -> bool:
     """
     更新 dns.he.net 的 A 记录
 
@@ -529,7 +505,6 @@ def update_he_dns(hostname: str, password: str, ip: str, record_index: int) -> b
         hostname: 要更新的主机名（如 dyn.example.com）
         password: 动态 DNS 密钥
         ip: 新的 IP 地址
-        record_index: 记录索引（用于日志显示）
 
     Returns:
         是否更新成功
@@ -542,7 +517,7 @@ def update_he_dns(hostname: str, password: str, ip: str, record_index: int) -> b
         'myip': ip
     }
 
-    logger.info(f"正在更新 A 记录 [{record_index}]: {hostname} -> {ip}...")
+    logger.info(f"正在更新 A 记录: {hostname} -> {ip}...")
 
     try:
         response = requests.get(url, params=params, timeout=30)
@@ -551,46 +526,22 @@ def update_he_dns(hostname: str, password: str, ip: str, record_index: int) -> b
         # 检查响应
         # 成功响应: "good 192.168.0.1" 或 "nochg 192.168.0.1"
         if result.startswith('good') or result.startswith('nochg'):
-            logger.info(f"  ✓ 记录 [{record_index}] 更新成功: {result}")
+            logger.info(f"✓ 更新成功: {result}")
             return True
         else:
-            logger.error(f"  ✗ 记录 [{record_index}] 更新失败: {result}")
+            logger.error(f"✗ 更新失败: {result}")
             return False
 
     except requests.RequestException as e:
-        logger.error(f"  ✗ 记录 [{record_index}] 请求失败: {e}")
+        logger.error(f"✗ 请求失败: {e}")
         return False
-
-
-def update_all_records(hostname: str, passwords: list[str], ips: list[str]) -> tuple[int, int]:
-    """
-    更新所有 A 记录
-
-    Args:
-        hostname: 主机名
-        passwords: 密钥列表
-        ips: IP 地址列表
-
-    Returns:
-        (成功数, 失败数)
-    """
-    success_count = 0
-    fail_count = 0
-
-    for i, (password, ip) in enumerate(zip(passwords, ips), 1):
-        if update_he_dns(hostname, password, ip, i):
-            success_count += 1
-        else:
-            fail_count += 1
-
-    return success_count, fail_count
 
 
 def main() -> int:
     """主函数"""
     print("=" * 60)
-    print("  HE.net DNS A 记录自动更新工具（负载均衡版）")
-    print(f"  选择最佳 {NUM_RECORDS} 个 Cloudflare 优化 IP 并自动更新")
+    print("  HE.net DNS A 记录自动更新工具")
+    print("  选择最佳 Cloudflare 优化 IP 并自动更新")
     print("=" * 60)
     print()
 
@@ -605,7 +556,6 @@ def main() -> int:
         logger.debug("调试模式已启用")
 
     logger.info(f"目标主机名: {config.hostname}")
-    logger.info(f"配置的密钥数量: {len(config.passwords)}")
     logger.info(f"丢包率筛选阈值: {config.pkg_lost_threshold}%")
 
     try:
@@ -625,60 +575,48 @@ def main() -> int:
 
         # 4. 选择最佳 IP
         if config.skip_ping:
-            # 跳过 ping 测试，直接使用前 N 个 IP
-            logger.info("跳过本地 ping 测试，直接使用解析到的 IP...")
+            # 跳过 ping 测试，直接使用第一个 IP
+            logger.info("跳过本地 ping 测试，直接使用解析到的第一个 IP...")
 
-            # 按照原始域名顺序（API 返回顺序通常已按质量排序）选择 IP
-            best_results = []
-            for ip, source_domains in list(ip_to_domains.items())[:NUM_RECORDS]:
-                result = PingResult(
-                    ip=ip,
-                    source_domains=source_domains,
-                    success=True
-                )
-                best_results.append(result)
+            first_ip = list(ip_to_domains.keys())[0]
+            best_result = PingResult(
+                ip=first_ip,
+                source_domains=ip_to_domains[first_ip],
+                success=True
+            )
 
             logger.info(f"\n{'='*60}")
-            logger.info(f"已选择 {len(best_results)} 个 IP:")
-            for i, r in enumerate(best_results, 1):
-                logger.info(f"  [{i}] {r.ip} (来源: {', '.join(r.source_domains[:2])})")
+            logger.info(f"选择 IP: {best_result.ip}")
+            logger.info(f"  来源: {', '.join(best_result.source_domains[:3])}")
             logger.info(f"{'='*60}")
         else:
             # 对所有 IP 进行 ping 测试
             results = test_all_ips(ip_to_domains, config.ping_count, config.ping_workers)
-            best_results = select_best_ips(results, NUM_RECORDS)
+            best_result = select_best_ip(results)
 
-        if not best_results:
+        if not best_result:
             logger.error("没有可用的 IP")
             return 1
 
-        # 5. 提取 IP 地址
-        ips = [r.ip for r in best_results]
+        # 5. 更新 DNS 记录
+        logger.info("")
+        success = update_he_dns(config.hostname, config.password, best_result.ip)
 
-        if len(ips) < NUM_RECORDS:
-            logger.warning(f"只有 {len(ips)} 个可用 IP，将只更新这些记录")
-
-        # 6. 更新 DNS 记录
-        logger.info(f"\n开始更新 {len(ips)} 个 A 记录...")
-        success_count, fail_count = update_all_records(
-            config.hostname,
-            config.passwords[:len(ips)],
-            ips
-        )
-
-        # 7. 输出结果
+        # 6. 输出结果
         print()
         print("=" * 60)
-        print("  更新完成！")
-        print(f"  成功: {success_count}, 失败: {fail_count}")
-        print()
-        print(f"  {config.hostname} 现在解析到以下 IP（轮询负载均衡）:")
-        for i, result in enumerate(best_results[:len(ips)], 1):
-            source = result.source_domains[0] if result.source_domains else "未知"
-            print(f"    [{i}] {result.ip} (来源: {source})")
+        if success:
+            print("  更新完成！")
+            print()
+            print(f"  {config.hostname} -> {best_result.ip}")
+            source = best_result.source_domains[0] if best_result.source_domains else "未知"
+            print(f"  来源: {source}")
+        else:
+            print("  更新失败！")
+            print("  请检查主机名和密钥是否正确")
         print("=" * 60)
 
-        return 0 if fail_count == 0 else 1
+        return 0 if success else 1
 
     except KeyboardInterrupt:
         logger.info("\n用户中断")
