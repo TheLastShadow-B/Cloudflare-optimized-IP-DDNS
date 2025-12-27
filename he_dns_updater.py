@@ -3,7 +3,8 @@
 HE.net DNS A 记录自动更新工具（负载均衡版）
 
 从 vps789.com 获取 Cloudflare 优化 IP 的 Top 20 域名，
-进行 ping 测试后选择最佳的 3 个域名，解析为 IP 后更新 dns.he.net 的 3 个 A 记录。
+筛选丢包率低于 0.5% 的域名，解析所有 IP 并去重，
+对 IP 进行 ping 测试后选择最佳的 3 个 IP 更新 dns.he.net 的 A 记录。
 多个 A 记录实现 DNS 轮询负载均衡。
 
 注意：dns.he.net 不支持通过 API 删除/创建记录，只能更新已有的动态 A 记录。
@@ -50,7 +51,7 @@ HE_HOSTNAME=
 # 用英文逗号分隔，例如: key1,key2,key3
 HE_PASSWORDS=
 
-# [可选] 每个域名的 ping 次数（默认: 100）
+# [可选] 每个 IP 的 ping 次数（默认: 100）
 PING_COUNT=100
 
 # [可选] 并发测试线程数（默认: 5）
@@ -58,6 +59,9 @@ PING_WORKERS=5
 
 # [可选] 获取域名列表的 API 地址（默认使用 vps789.com）
 API_URL=https://vps789.com/public/sum/cfIpTop20
+
+# [可选] 丢包率筛选阈值，低于此值的域名才会被解析（默认: 0.5）
+PKG_LOST_THRESHOLD=0.5
 
 # [可选] 是否跳过本地 ping 测试，直接使用 API 数据（true/false，默认: false）
 SKIP_PING=false
@@ -76,6 +80,9 @@ logger = logging.getLogger(__name__)
 # 负载均衡 A 记录数量
 NUM_RECORDS = 3
 
+# 默认丢包率筛选阈值
+DEFAULT_PKG_LOST_THRESHOLD = 0.5
+
 
 @dataclass
 class Config:
@@ -85,6 +92,7 @@ class Config:
     ping_count: int = 100
     ping_workers: int = 5
     api_url: str = "https://vps789.com/public/sum/cfIpTop20"
+    pkg_lost_threshold: float = DEFAULT_PKG_LOST_THRESHOLD
     skip_ping: bool = False
     debug: bool = False
 
@@ -92,7 +100,8 @@ class Config:
 @dataclass
 class PingResult:
     """Ping 测试结果"""
-    domain: str
+    ip: str
+    source_domains: list[str] = field(default_factory=list)
     packets_sent: int = 0
     packets_received: int = 0
     packet_loss: float = 100.0
@@ -100,7 +109,6 @@ class PingResult:
     avg_latency: float = float('inf')
     max_latency: float = float('inf')
     success: bool = False
-    resolved_ip: Optional[str] = None
 
 
 @dataclass
@@ -210,12 +218,21 @@ def load_config() -> Optional[Config]:
         except ValueError:
             return default
 
+    def parse_float(value: str, default: float) -> float:
+        if not value:
+            return default
+        try:
+            return float(value)
+        except ValueError:
+            return default
+
     config = Config(
         hostname=hostname,
         passwords=passwords[:NUM_RECORDS],  # 只取前 3 个
         ping_count=parse_int(env_vars.get('PING_COUNT', ''), 100),
         ping_workers=parse_int(env_vars.get('PING_WORKERS', ''), 5),
         api_url=env_vars.get('API_URL', '').strip() or "https://vps789.com/public/sum/cfIpTop20",
+        pkg_lost_threshold=parse_float(env_vars.get('PKG_LOST_THRESHOLD', ''), DEFAULT_PKG_LOST_THRESHOLD),
         skip_ping=parse_bool(env_vars.get('SKIP_PING', ''), False),
         debug=parse_bool(env_vars.get('DEBUG', ''), False),
     )
@@ -262,27 +279,80 @@ def fetch_top_domains(url: str) -> list[DomainInfo]:
         raise
 
 
-def ping_domain(domain: str, count: int = 100, timeout: int = 5) -> PingResult:
+def filter_and_resolve_domains(domains: list[DomainInfo], threshold: float) -> dict[str, list[str]]:
     """
-    对域名进行 ping 测试
+    筛选丢包率低于阈值的域名，并解析为 IP，合并去重
 
     Args:
-        domain: 要测试的域名
+        domains: 域名信息列表
+        threshold: 丢包率阈值
+
+    Returns:
+        IP 到来源域名列表的映射 {ip: [domain1, domain2, ...]}
+    """
+    # 筛选丢包率低于阈值的域名
+    filtered_domains = [d for d in domains if d.avg_pkg_lost_rate < threshold]
+    logger.info(f"筛选丢包率 < {threshold}% 的域名: {len(filtered_domains)}/{len(domains)} 个")
+
+    if not filtered_domains:
+        logger.warning(f"没有丢包率低于 {threshold}% 的域名，将使用所有域名")
+        filtered_domains = domains
+
+    # 解析所有域名的 IP 并去重
+    ip_to_domains: dict[str, list[str]] = {}
+
+    for d in filtered_domains:
+        ip = resolve_domain(d.domain)
+        if ip:
+            if ip not in ip_to_domains:
+                ip_to_domains[ip] = []
+            ip_to_domains[ip].append(d.domain)
+
+    logger.info(f"解析得到 {len(ip_to_domains)} 个不重复 IP")
+
+    return ip_to_domains
+
+
+def resolve_domain(domain: str) -> Optional[str]:
+    """
+    解析域名获取 IP 地址
+
+    Args:
+        domain: 域名
+
+    Returns:
+        IP 地址，解析失败返回 None
+    """
+    try:
+        ip = socket.gethostbyname(domain)
+        logger.debug(f"域名 {domain} 解析为 IP: {ip}")
+        return ip
+    except socket.gaierror as e:
+        logger.debug(f"解析域名 {domain} 失败: {e}")
+        return None
+
+
+def ping_ip(ip: str, count: int = 100, timeout: int = 5) -> PingResult:
+    """
+    对 IP 进行 ping 测试
+
+    Args:
+        ip: 要测试的 IP 地址
         count: ping 次数
         timeout: 超时时间（秒）
 
     Returns:
         PingResult 对象
     """
-    result = PingResult(domain=domain)
+    result = PingResult(ip=ip)
     system = platform.system().lower()
 
     try:
         # 构建 ping 命令
         if system == 'windows':
-            cmd = ['ping', '-n', str(count), '-w', str(timeout * 1000), domain]
+            cmd = ['ping', '-n', str(count), '-w', str(timeout * 1000), ip]
         else:  # Linux/macOS
-            cmd = ['ping', '-c', str(count), '-W', str(timeout), domain]
+            cmd = ['ping', '-c', str(count), '-W', str(timeout), ip]
 
         logger.debug(f"执行命令: {' '.join(cmd)}")
 
@@ -298,23 +368,23 @@ def ping_domain(domain: str, count: int = 100, timeout: int = 5) -> PingResult:
 
         # 解析结果
         if system == 'windows':
-            result = parse_windows_ping(domain, output, count)
+            result = parse_windows_ping(ip, output, count)
         else:
-            result = parse_unix_ping(domain, output, count)
+            result = parse_unix_ping(ip, output, count)
 
     except subprocess.TimeoutExpired:
-        logger.warning(f"Ping {domain} 超时")
+        logger.warning(f"Ping {ip} 超时")
     except FileNotFoundError:
         logger.error("找不到 ping 命令")
     except Exception as e:
-        logger.error(f"Ping {domain} 出错: {e}")
+        logger.error(f"Ping {ip} 出错: {e}")
 
     return result
 
 
-def parse_unix_ping(domain: str, output: str, count: int) -> PingResult:
+def parse_unix_ping(ip: str, output: str, count: int) -> PingResult:
     """解析 Unix/Linux/macOS ping 输出"""
-    result = PingResult(domain=domain, packets_sent=count)
+    result = PingResult(ip=ip, packets_sent=count)
 
     # 解析丢包率
     loss_pattern = r'(\d+)\s+packets?\s+transmitted,\s+(\d+)\s+(?:packets?\s+)?received.*?(\d+(?:\.\d+)?)\s*%\s*packet\s*loss'
@@ -338,9 +408,9 @@ def parse_unix_ping(domain: str, output: str, count: int) -> PingResult:
     return result
 
 
-def parse_windows_ping(domain: str, output: str, count: int) -> PingResult:
+def parse_windows_ping(ip: str, output: str, count: int) -> PingResult:
     """解析 Windows ping 输出"""
-    result = PingResult(domain=domain, packets_sent=count)
+    result = PingResult(ip=ip, packets_sent=count)
 
     # 解析丢包率
     loss_pattern = r'Sent\s*=\s*(\d+),\s*Received\s*=\s*(\d+),\s*Lost\s*=\s*(\d+)\s*\((\d+(?:\.\d+)?)\s*%\s*loss\)'
@@ -364,62 +434,64 @@ def parse_windows_ping(domain: str, output: str, count: int) -> PingResult:
     return result
 
 
-def test_all_domains(domains: list[DomainInfo], ping_count: int = 100,
-                     max_workers: int = 5) -> list[PingResult]:
+def test_all_ips(ip_to_domains: dict[str, list[str]], ping_count: int = 100,
+                 max_workers: int = 5) -> list[PingResult]:
     """
-    对所有域名进行并发 ping 测试
+    对所有 IP 进行并发 ping 测试
 
     Args:
-        domains: 域名列表
-        ping_count: 每个域名的 ping 次数
+        ip_to_domains: IP 到来源域名的映射
+        ping_count: 每个 IP 的 ping 次数
         max_workers: 并发数
 
     Returns:
         测试结果列表
     """
-    logger.info(f"开始测试 {len(domains)} 个域名，每个 ping {ping_count} 次...")
+    ips = list(ip_to_domains.keys())
+    logger.info(f"开始测试 {len(ips)} 个 IP，每个 ping {ping_count} 次...")
     results = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_domain = {
-            executor.submit(ping_domain, d.domain, ping_count): d.domain
-            for d in domains
+        future_to_ip = {
+            executor.submit(ping_ip, ip, ping_count): ip
+            for ip in ips
         }
 
-        for future in as_completed(future_to_domain):
-            domain = future_to_domain[future]
+        for future in as_completed(future_to_ip):
+            ip = future_to_ip[future]
             try:
                 result = future.result()
+                result.source_domains = ip_to_domains.get(ip, [])
                 results.append(result)
                 if result.success:
-                    logger.info(f"✓ {domain}: 丢包率={result.packet_loss:.1f}%, "
+                    logger.info(f"✓ {ip}: 丢包率={result.packet_loss:.1f}%, "
                                f"平均延迟={result.avg_latency:.1f}ms")
                 else:
-                    logger.warning(f"✗ {domain}: 测试失败")
+                    logger.warning(f"✗ {ip}: 测试失败")
             except Exception as e:
-                logger.error(f"✗ {domain}: {e}")
-                results.append(PingResult(domain=domain))
+                logger.error(f"✗ {ip}: {e}")
+                results.append(PingResult(ip=ip, source_domains=ip_to_domains.get(ip, [])))
 
     return results
 
 
-def select_best_domains(results: list[PingResult], count: int = NUM_RECORDS) -> list[PingResult]:
+def select_best_ips(results: list[PingResult], count: int = NUM_RECORDS) -> list[PingResult]:
     """
-    选择最佳的多个域名
+    选择最佳的多个 IP
     优先考虑丢包率，其次考虑平均延迟
 
     Args:
         results: ping 测试结果列表
-        count: 需要选择的域名数量
+        count: 需要选择的 IP 数量
 
     Returns:
-        最佳域名的测试结果列表
+        最佳 IP 的测试结果列表
     """
     # 过滤成功的结果
     valid_results = [r for r in results if r.success]
 
     if not valid_results:
-        logger.error("没有可用的域名")
+        logger.error("没有可用的 IP")
         return []
 
     # 按丢包率和延迟排序
@@ -428,53 +500,25 @@ def select_best_domains(results: list[PingResult], count: int = NUM_RECORDS) -> 
         key=lambda x: (x.packet_loss, x.avg_latency)
     )
 
-    # 取前 count 个，并确保 IP 不重复
-    best_results = []
-    seen_ips = set()
-
-    for result in sorted_results:
-        # 解析域名获取 IP
-        ip = resolve_domain(result.domain)
-        if ip and ip not in seen_ips:
-            result.resolved_ip = ip
-            best_results.append(result)
-            seen_ips.add(ip)
-
-            if len(best_results) >= count:
-                break
+    # 取前 count 个
+    best_results = sorted_results[:count]
 
     if len(best_results) < count:
-        logger.warning(f"只找到 {len(best_results)} 个不重复 IP 的可用域名（需要 {count} 个）")
+        logger.warning(f"只找到 {len(best_results)} 个可用 IP（需要 {count} 个）")
 
     # 输出结果
     logger.info(f"\n{'='*60}")
-    logger.info(f"已选择最佳的 {len(best_results)} 个域名（用于负载均衡）:")
+    logger.info(f"已选择最佳的 {len(best_results)} 个 IP（用于负载均衡）:")
     for i, r in enumerate(best_results, 1):
-        logger.info(f"  [{i}] {r.domain}")
-        logger.info(f"      IP: {r.resolved_ip}")
+        domains_str = ', '.join(r.source_domains[:2])
+        if len(r.source_domains) > 2:
+            domains_str += f" 等 {len(r.source_domains)} 个域名"
+        logger.info(f"  [{i}] {r.ip}")
+        logger.info(f"      来源: {domains_str}")
         logger.info(f"      丢包率: {r.packet_loss:.1f}%, 平均延迟: {r.avg_latency:.1f}ms")
     logger.info(f"{'='*60}")
 
     return best_results
-
-
-def resolve_domain(domain: str) -> Optional[str]:
-    """
-    解析域名获取 IP 地址
-
-    Args:
-        domain: 域名
-
-    Returns:
-        IP 地址，解析失败返回 None
-    """
-    try:
-        ip = socket.gethostbyname(domain)
-        logger.debug(f"域名 {domain} 解析为 IP: {ip}")
-        return ip
-    except socket.gaierror as e:
-        logger.error(f"解析域名 {domain} 失败: {e}")
-        return None
 
 
 def update_he_dns(hostname: str, password: str, ip: str, record_index: int) -> bool:
@@ -562,6 +606,7 @@ def main() -> int:
 
     logger.info(f"目标主机名: {config.hostname}")
     logger.info(f"配置的密钥数量: {len(config.passwords)}")
+    logger.info(f"丢包率筛选阈值: {config.pkg_lost_threshold}%")
 
     try:
         # 2. 获取域名列表
@@ -571,58 +616,49 @@ def main() -> int:
             logger.error("未获取到任何域名")
             return 1
 
-        # 3. 选择最佳域名
-        if config.skip_ping:
-            # 使用 API 数据选择
-            logger.info("使用 API 返回的数据选择最佳域名（跳过本地 ping 测试）...")
-            sorted_domains = sorted(
-                domains,
-                key=lambda x: (x.avg_pkg_lost_rate, x.avg_latency)
-            )
+        # 3. 筛选域名并解析 IP
+        ip_to_domains = filter_and_resolve_domains(domains, config.pkg_lost_threshold)
 
-            # 解析并去重
-            best_results = []
-            seen_ips = set()
-
-            for d in sorted_domains:
-                ip = resolve_domain(d.domain)
-                if ip and ip not in seen_ips:
-                    result = PingResult(
-                        domain=d.domain,
-                        packet_loss=d.avg_pkg_lost_rate,
-                        avg_latency=d.avg_latency,
-                        success=True,
-                        resolved_ip=ip
-                    )
-                    best_results.append(result)
-                    seen_ips.add(ip)
-
-                    if len(best_results) >= NUM_RECORDS:
-                        break
-
-            logger.info(f"\n{'='*60}")
-            logger.info(f"已选择最佳的 {len(best_results)} 个域名（基于 API 数据）:")
-            for i, r in enumerate(best_results, 1):
-                logger.info(f"  [{i}] {r.domain}")
-                logger.info(f"      IP: {r.resolved_ip}")
-                logger.info(f"      丢包率: {r.packet_loss:.2f}%, 平均延迟: {r.avg_latency:.1f}ms")
-            logger.info(f"{'='*60}")
-        else:
-            # 进行本地 ping 测试
-            results = test_all_domains(domains, config.ping_count, config.ping_workers)
-            best_results = select_best_domains(results, NUM_RECORDS)
-
-        if not best_results:
-            logger.error("没有可用的域名")
+        if not ip_to_domains:
+            logger.error("没有可解析的 IP")
             return 1
 
-        # 4. 提取 IP 地址
-        ips = [r.resolved_ip for r in best_results if r.resolved_ip]
+        # 4. 选择最佳 IP
+        if config.skip_ping:
+            # 跳过 ping 测试，直接使用前 N 个 IP
+            logger.info("跳过本地 ping 测试，直接使用解析到的 IP...")
+
+            # 按照原始域名顺序（API 返回顺序通常已按质量排序）选择 IP
+            best_results = []
+            for ip, source_domains in list(ip_to_domains.items())[:NUM_RECORDS]:
+                result = PingResult(
+                    ip=ip,
+                    source_domains=source_domains,
+                    success=True
+                )
+                best_results.append(result)
+
+            logger.info(f"\n{'='*60}")
+            logger.info(f"已选择 {len(best_results)} 个 IP:")
+            for i, r in enumerate(best_results, 1):
+                logger.info(f"  [{i}] {r.ip} (来源: {', '.join(r.source_domains[:2])})")
+            logger.info(f"{'='*60}")
+        else:
+            # 对所有 IP 进行 ping 测试
+            results = test_all_ips(ip_to_domains, config.ping_count, config.ping_workers)
+            best_results = select_best_ips(results, NUM_RECORDS)
+
+        if not best_results:
+            logger.error("没有可用的 IP")
+            return 1
+
+        # 5. 提取 IP 地址
+        ips = [r.ip for r in best_results]
 
         if len(ips) < NUM_RECORDS:
             logger.warning(f"只有 {len(ips)} 个可用 IP，将只更新这些记录")
 
-        # 5. 更新 DNS 记录
+        # 6. 更新 DNS 记录
         logger.info(f"\n开始更新 {len(ips)} 个 A 记录...")
         success_count, fail_count = update_all_records(
             config.hostname,
@@ -630,7 +666,7 @@ def main() -> int:
             ips
         )
 
-        # 6. 输出结果
+        # 7. 输出结果
         print()
         print("=" * 60)
         print("  更新完成！")
@@ -638,7 +674,8 @@ def main() -> int:
         print()
         print(f"  {config.hostname} 现在解析到以下 IP（轮询负载均衡）:")
         for i, result in enumerate(best_results[:len(ips)], 1):
-            print(f"    [{i}] {result.resolved_ip} (来源: {result.domain})")
+            source = result.source_domains[0] if result.source_domains else "未知"
+            print(f"    [{i}] {result.ip} (来源: {source})")
         print("=" * 60)
 
         return 0 if fail_count == 0 else 1
