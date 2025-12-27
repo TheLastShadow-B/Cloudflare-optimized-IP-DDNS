@@ -317,7 +317,9 @@ def get_cfst_download_url() -> tuple[str, str]:
         'x64': 'amd64',
         'arm64': 'arm64',
         'aarch64': 'arm64',
-        'armv7l': 'arm',
+        'armv7l': 'armv7',
+        'armv6l': 'armv6',
+        'armv5l': 'armv5',
         'i386': '386',
         'i686': '386',
     }
@@ -331,11 +333,12 @@ def get_cfst_download_url() -> tuple[str, str]:
     }
     os_name = os_map.get(system, 'linux')
 
-    # 构建文件名
-    if os_name == 'windows':
-        filename = f"CloudflareST_windows_{arch}.zip"
+    # 构建文件名（cfst_ 前缀）
+    # Linux 使用 .tar.gz，macOS 和 Windows 使用 .zip
+    if os_name == 'linux':
+        filename = f"cfst_linux_{arch}.tar.gz"
     else:
-        filename = f"CloudflareST_{os_name}_{arch}.tar.gz"
+        filename = f"cfst_{os_name}_{arch}.zip"
 
     # GitHub 最新版本下载地址
     base_url = "https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download"
@@ -377,6 +380,7 @@ def download_cfst_tool(target_path: Path) -> bool:
         # 解压文件
         system = platform.system().lower()
         extract_dir = target_path.parent
+        extracted = False
 
         if filename.endswith('.tar.gz'):
             with tarfile.open(tmp_path, 'r:gz') as tar:
@@ -385,17 +389,25 @@ def download_cfst_tool(target_path: Path) -> bool:
                     if member.name.endswith('CloudflareST') or member.name == 'CloudflareST':
                         member.name = target_path.name
                         tar.extract(member, extract_dir)
+                        extracted = True
                         break
         elif filename.endswith('.zip'):
             with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
                 for name in zip_ref.namelist():
-                    if 'CloudflareST' in name and name.endswith('.exe'):
+                    # Windows: CloudflareST.exe, macOS: CloudflareST
+                    base_name = name.split('/')[-1]  # 处理可能的目录结构
+                    if base_name == 'CloudflareST.exe' or base_name == 'CloudflareST':
                         with zip_ref.open(name) as src, open(target_path, 'wb') as dst:
                             dst.write(src.read())
+                        extracted = True
                         break
 
         # 清理临时文件
         Path(tmp_path).unlink(missing_ok=True)
+
+        if not extracted:
+            logger.error("解压失败：未找到可执行文件")
+            return False
 
         # 设置可执行权限（Unix 系统）
         if system != 'windows':
