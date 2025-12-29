@@ -4,7 +4,8 @@ HE.net DNS A 记录自动更新工具
 
 从 vps789.com 获取 Cloudflare 优化 IP 的 Top 20 域名，
 筛选丢包率低于阈值的域名，解析所有 IP 并去重，
-对 IP 进行 ping 测试后选择最佳的 1 个 IP 更新 dns.he.net 的 A 记录。
+使用 cfst 工具测试延迟、丢包率和下载速度，
+选择丢包率为 0 且速度最快的 IP 更新 dns.he.net 的 A 记录。
 
 配置文件: .env（与脚本同目录）
 运行方式: python he_dns_updater.py（无需任何参数）
@@ -18,11 +19,9 @@ import subprocess
 import platform
 import re
 import socket
-import struct
 import requests
 import logging
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -47,12 +46,6 @@ HE_HOSTNAME=
 # [必填] dns.he.net 动态 DNS 密钥
 HE_PASSWORD=
 
-# [可选] 每个 IP 的 ping 次数（默认: 100）
-PING_COUNT=100
-
-# [可选] 并发测试线程数（默认: 5）
-PING_WORKERS=5
-
 # [可选] 获取域名列表的 API 地址（默认使用 vps789.com）
 API_URL=https://vps789.com/public/sum/cfIpTop20
 
@@ -62,13 +55,10 @@ PKG_LOST_THRESHOLD=0.5
 # [可选] DNS 服务器列表，用逗号分隔（默认: 119.29.29.29,223.5.5.5）
 DNS_SERVERS=119.29.29.29,223.5.5.5
 
-# [可选] 是否跳过本地 ping 测试，直接使用 API 数据（true/false，默认: false）
-SKIP_PING=false
-
 # [可选] 是否启用调试模式（true/false，默认: false）
 DEBUG=false
 
-# ============ CloudflareSpeedTest (cfst) 速度测试配置 ============
+# ============ CloudflareSpeedTest (cfst) 测试配置 ============
 
 # [必填] cfst 测速地址（必须指定，建议自建测速地址）
 # 该地址用于下载测速，应该是一个支持 Cloudflare CDN 的文件地址
@@ -78,8 +68,8 @@ CFST_URL=
 # 如果工具不存在，会自动从 GitHub 下载
 CFST_PATH=
 
-# [可选] 进入速度测试的 IP 数量（默认: 8，从 ping 测试结果中选取前 N 个）
-CFST_TOP_COUNT=8
+# [可选] cfst ping 测试次数（默认: 10，用于测量延迟和丢包率）
+CFST_PING_COUNT=10
 
 # [可选] 速度测试超时时间，单位秒（默认: 10）
 CFST_TIMEOUT=10
@@ -101,33 +91,16 @@ class Config:
     """配置类"""
     hostname: str
     password: str
-    ping_count: int = 100
-    ping_workers: int = 5
     api_url: str = "https://vps789.com/public/sum/cfIpTop20"
     pkg_lost_threshold: float = 0.5
     dns_servers: list[str] = field(default_factory=lambda: ['119.29.29.29', '223.5.5.5'])
-    skip_ping: bool = False
     debug: bool = False
     # cfst 速度测试配置
     cfst_url: str = ""  # 测速地址（必填）
     cfst_path: str = ""  # cfst 工具路径（可选）
-    cfst_top_count: int = 8  # 进入速度测试的 IP 数量
     cfst_timeout: int = 10  # 速度测试超时时间
     cfst_port: int = 443  # 速度测试端口
-
-
-@dataclass
-class PingResult:
-    """Ping 测试结果"""
-    ip: str
-    source_domains: list[str] = field(default_factory=list)
-    packets_sent: int = 0
-    packets_received: int = 0
-    packet_loss: float = 100.0
-    min_latency: float = float('inf')
-    avg_latency: float = float('inf')
-    max_latency: float = float('inf')
-    success: bool = False
+    cfst_ping_count: int = 10  # cfst ping 测试次数（确保丢包率准确）
 
 
 @dataclass
@@ -136,6 +109,8 @@ class SpeedTestResult:
     ip: str
     download_speed: float = 0.0  # MB/s
     avg_latency: float = float('inf')  # ms
+    packet_loss: float = 100.0  # 丢包率 %
+    source_domains: list[str] = field(default_factory=list)  # 来源域名
     success: bool = False
 
 
@@ -261,19 +236,16 @@ def load_config() -> Optional[Config]:
     config = Config(
         hostname=hostname,
         password=password,
-        ping_count=parse_int(env_vars.get('PING_COUNT', ''), 100),
-        ping_workers=parse_int(env_vars.get('PING_WORKERS', ''), 5),
         api_url=env_vars.get('API_URL', '').strip() or "https://vps789.com/public/sum/cfIpTop20",
         pkg_lost_threshold=parse_float(env_vars.get('PKG_LOST_THRESHOLD', ''), 0.5),
         dns_servers=dns_servers,
-        skip_ping=parse_bool(env_vars.get('SKIP_PING', ''), False),
         debug=parse_bool(env_vars.get('DEBUG', ''), False),
-        # cfst 速度测试配置
+        # cfst 测试配置
         cfst_url=env_vars.get('CFST_URL', '').strip(),
         cfst_path=env_vars.get('CFST_PATH', '').strip(),
-        cfst_top_count=parse_int(env_vars.get('CFST_TOP_COUNT', ''), 8),
         cfst_timeout=parse_int(env_vars.get('CFST_TIMEOUT', ''), 10),
         cfst_port=parse_int(env_vars.get('CFST_PORT', ''), 443),
+        cfst_ping_count=parse_int(env_vars.get('CFST_PING_COUNT', ''), 10),
     )
 
     return config
@@ -679,169 +651,27 @@ def resolve_with_nslookup(domain: str, dns_server: str, timeout: float = 5.0) ->
     return ips
 
 
-def ping_ip(ip: str, count: int = 100, timeout: int = 5) -> PingResult:
+def run_speed_test(ips: list[str], ip_to_domains: dict[str, list[str]], config: Config, cfst_path: Path) -> list[SpeedTestResult]:
     """
-    对 IP 进行 ping 测试
-
-    Args:
-        ip: 要测试的 IP 地址
-        count: ping 次数
-        timeout: 超时时间（秒）
-
-    Returns:
-        PingResult 对象
-    """
-    result = PingResult(ip=ip)
-    system = platform.system().lower()
-
-    try:
-        # 构建 ping 命令
-        if system == 'windows':
-            cmd = ['ping', '-n', str(count), '-w', str(timeout * 1000), ip]
-        else:  # Linux/macOS
-            cmd = ['ping', '-c', str(count), '-W', str(timeout), ip]
-
-        logger.debug(f"执行命令: {' '.join(cmd)}")
-
-        # 执行 ping
-        process = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=count * timeout + 60  # 总超时时间
-        )
-
-        output = process.stdout + process.stderr
-
-        # 解析结果
-        if system == 'windows':
-            result = parse_windows_ping(ip, output, count)
-        else:
-            result = parse_unix_ping(ip, output, count)
-
-    except subprocess.TimeoutExpired:
-        logger.warning(f"Ping {ip} 超时")
-    except FileNotFoundError:
-        logger.error("找不到 ping 命令")
-    except Exception as e:
-        logger.error(f"Ping {ip} 出错: {e}")
-
-    return result
-
-
-def parse_unix_ping(ip: str, output: str, count: int) -> PingResult:
-    """解析 Unix/Linux/macOS ping 输出"""
-    result = PingResult(ip=ip, packets_sent=count)
-
-    # 解析丢包率
-    loss_pattern = r'(\d+)\s+packets?\s+transmitted,\s+(\d+)\s+(?:packets?\s+)?received.*?(\d+(?:\.\d+)?)\s*%\s*packet\s*loss'
-    loss_match = re.search(loss_pattern, output, re.IGNORECASE)
-
-    if loss_match:
-        result.packets_sent = int(loss_match.group(1))
-        result.packets_received = int(loss_match.group(2))
-        result.packet_loss = float(loss_match.group(3))
-        result.success = result.packets_received > 0
-
-    # 解析延迟
-    latency_pattern = r'(?:round-trip|rtt)\s+min/avg/max/(?:stddev|mdev)\s*=\s*([\d.]+)/([\d.]+)/([\d.]+)'
-    latency_match = re.search(latency_pattern, output, re.IGNORECASE)
-
-    if latency_match:
-        result.min_latency = float(latency_match.group(1))
-        result.avg_latency = float(latency_match.group(2))
-        result.max_latency = float(latency_match.group(3))
-
-    return result
-
-
-def parse_windows_ping(ip: str, output: str, count: int) -> PingResult:
-    """解析 Windows ping 输出"""
-    result = PingResult(ip=ip, packets_sent=count)
-
-    # 解析丢包率
-    loss_pattern = r'Sent\s*=\s*(\d+),\s*Received\s*=\s*(\d+),\s*Lost\s*=\s*(\d+)\s*\((\d+(?:\.\d+)?)\s*%\s*loss\)'
-    loss_match = re.search(loss_pattern, output, re.IGNORECASE)
-
-    if loss_match:
-        result.packets_sent = int(loss_match.group(1))
-        result.packets_received = int(loss_match.group(2))
-        result.packet_loss = float(loss_match.group(4))
-        result.success = result.packets_received > 0
-
-    # 解析延迟
-    latency_pattern = r'Minimum\s*=\s*(\d+)\s*ms,\s*Maximum\s*=\s*(\d+)\s*ms,\s*Average\s*=\s*(\d+)\s*ms'
-    latency_match = re.search(latency_pattern, output, re.IGNORECASE)
-
-    if latency_match:
-        result.min_latency = float(latency_match.group(1))
-        result.max_latency = float(latency_match.group(2))
-        result.avg_latency = float(latency_match.group(3))
-
-    return result
-
-
-def test_all_ips(ip_to_domains: dict[str, list[str]], ping_count: int = 100,
-                 max_workers: int = 5) -> list[PingResult]:
-    """
-    对所有 IP 进行并发 ping 测试
-
-    Args:
-        ip_to_domains: IP 到来源域名的映射
-        ping_count: 每个 IP 的 ping 次数
-        max_workers: 并发数
-
-    Returns:
-        测试结果列表
-    """
-    ips = list(ip_to_domains.keys())
-    logger.info(f"开始测试 {len(ips)} 个 IP，每个 ping {ping_count} 次...")
-    results = []
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_ip = {
-            executor.submit(ping_ip, ip, ping_count): ip
-            for ip in ips
-        }
-
-        for future in as_completed(future_to_ip):
-            ip = future_to_ip[future]
-            try:
-                result = future.result()
-                result.source_domains = ip_to_domains.get(ip, [])
-                results.append(result)
-                if result.success:
-                    logger.info(f"✓ {ip}: 丢包率={result.packet_loss:.1f}%, "
-                               f"平均延迟={result.avg_latency:.1f}ms")
-                else:
-                    logger.warning(f"✗ {ip}: 测试失败")
-            except Exception as e:
-                logger.error(f"✗ {ip}: {e}")
-                results.append(PingResult(ip=ip, source_domains=ip_to_domains.get(ip, [])))
-
-    return results
-
-
-def run_speed_test(ips: list[str], config: Config, cfst_path: Path) -> list[SpeedTestResult]:
-    """
-    使用 cfst 工具进行速度测试
+    使用 cfst 工具进行延迟和速度测试
 
     Args:
         ips: 要测试的 IP 列表
+        ip_to_domains: IP 到来源域名的映射
         config: 配置对象
         cfst_path: cfst 工具路径
 
     Returns:
-        速度测试结果列表，按下载速度降序排列
+        测试结果列表
     """
     import csv
-    import tempfile
 
     if not ips:
         return []
 
-    logger.info(f"\n开始速度测试，共 {len(ips)} 个 IP...")
+    logger.info(f"\n开始测试，共 {len(ips)} 个 IP...")
     logger.info(f"测速地址: {config.cfst_url}")
+    logger.info(f"Ping 次数: {config.cfst_ping_count}")
 
     # 创建临时结果文件
     result_file = SCRIPT_DIR / 'cfst_result.csv'
@@ -850,6 +680,7 @@ def run_speed_test(ips: list[str], config: Config, cfst_path: Path) -> list[Spee
     # -ip: 指定 IP 列表
     # -url: 测速地址
     # -o: 输出文件
+    # -t: ping 次数（用于测量延迟和丢包率）
     # -dn: 测速数量（与 IP 数量相同）
     # -dt: 测速时间
     # -tp: 测速端口
@@ -860,6 +691,7 @@ def run_speed_test(ips: list[str], config: Config, cfst_path: Path) -> list[Spee
         '-ip', ip_list,
         '-url', config.cfst_url,
         '-o', str(result_file),
+        '-t', str(config.cfst_ping_count),  # ping 次数
         '-dn', str(len(ips)),  # 测试所有 IP
         '-dt', str(config.cfst_timeout),
         '-tp', str(config.cfst_port),
@@ -874,7 +706,7 @@ def run_speed_test(ips: list[str], config: Config, cfst_path: Path) -> list[Spee
             cmd,
             capture_output=True,
             text=True,
-            timeout=config.cfst_timeout * len(ips) + 60,  # 总超时时间
+            timeout=config.cfst_timeout * len(ips) + config.cfst_ping_count * len(ips) + 120,  # 总超时时间
             cwd=str(SCRIPT_DIR)  # 在脚本目录下执行
         )
 
@@ -888,10 +720,10 @@ def run_speed_test(ips: list[str], config: Config, cfst_path: Path) -> list[Spee
             logger.warning(f"cfst 警告: {process.stderr}")
 
     except subprocess.TimeoutExpired:
-        logger.error("速度测试超时")
+        logger.error("测试超时")
         return []
     except Exception as e:
-        logger.error(f"速度测试失败: {e}")
+        logger.error(f"测试失败: {e}")
         return []
 
     # 解析结果文件
@@ -908,24 +740,30 @@ def run_speed_test(ips: list[str], config: Config, cfst_path: Path) -> list[Spee
                     ip_idx = 0
                     speed_idx = -1
                     latency_idx = -1
+                    loss_idx = -1
 
                     for i, col in enumerate(header):
                         if '下载速度' in col or 'speed' in col.lower():
                             speed_idx = i
                         if '延迟' in col or 'latency' in col.lower():
                             latency_idx = i
+                        if '丢包' in col or 'loss' in col.lower():
+                            loss_idx = i
 
                     for row in reader:
-                        if len(row) > max(ip_idx, speed_idx, latency_idx):
+                        if len(row) > ip_idx:
                             try:
                                 ip = row[ip_idx].strip()
-                                speed = float(row[speed_idx].strip()) if speed_idx >= 0 and row[speed_idx].strip() else 0.0
-                                latency = float(row[latency_idx].strip()) if latency_idx >= 0 and row[latency_idx].strip() else float('inf')
+                                speed = float(row[speed_idx].strip()) if speed_idx >= 0 and speed_idx < len(row) and row[speed_idx].strip() else 0.0
+                                latency = float(row[latency_idx].strip()) if latency_idx >= 0 and latency_idx < len(row) and row[latency_idx].strip() else float('inf')
+                                loss = float(row[loss_idx].strip()) if loss_idx >= 0 and loss_idx < len(row) and row[loss_idx].strip() else 100.0
 
                                 results.append(SpeedTestResult(
                                     ip=ip,
                                     download_speed=speed,
                                     avg_latency=latency,
+                                    packet_loss=loss,
+                                    source_domains=ip_to_domains.get(ip, []),
                                     success=speed > 0
                                 ))
                             except (ValueError, IndexError) as e:
@@ -935,63 +773,17 @@ def run_speed_test(ips: list[str], config: Config, cfst_path: Path) -> list[Spee
             result_file.unlink(missing_ok=True)
 
         except Exception as e:
-            logger.error(f"解析速度测试结果失败: {e}")
-
-    # 按下载速度降序排序
-    results.sort(key=lambda x: x.download_speed, reverse=True)
+            logger.error(f"解析测试结果失败: {e}")
 
     # 输出结果摘要
     if results:
-        logger.info(f"\n速度测试完成，有效结果: {len([r for r in results if r.success])}/{len(results)}")
-        for i, r in enumerate(results[:5], 1):
-            if r.success:
-                logger.info(f"  {i}. {r.ip}: {r.download_speed:.2f} MB/s, 延迟 {r.avg_latency:.1f}ms")
+        logger.info(f"\n测试完成，有效结果: {len([r for r in results if r.success])}/{len(results)}")
+        for i, r in enumerate(results[:10], 1):
+            logger.info(f"  {i}. {r.ip}: 丢包率={r.packet_loss:.1f}%, 延迟={r.avg_latency:.1f}ms, 速度={r.download_speed:.2f} MB/s")
     else:
-        logger.warning("速度测试未获得任何有效结果")
+        logger.warning("测试未获得任何有效结果")
 
     return results
-
-
-def select_best_ip(results: list[PingResult]) -> Optional[PingResult]:
-    """
-    选择最佳的 IP
-    优先考虑丢包率，其次考虑平均延迟
-
-    Args:
-        results: ping 测试结果列表
-
-    Returns:
-        最佳 IP 的测试结果，如果没有可用 IP 返回 None
-    """
-    # 过滤成功的结果
-    valid_results = [r for r in results if r.success]
-
-    if not valid_results:
-        logger.error("没有可用的 IP")
-        return None
-
-    # 按丢包率和延迟排序
-    sorted_results = sorted(
-        valid_results,
-        key=lambda x: (x.packet_loss, x.avg_latency)
-    )
-
-    best = sorted_results[0]
-
-    # 输出结果
-    logger.info(f"\n{'='*60}")
-    logger.info(f"最佳 IP: {best.ip}")
-    domains_str = ', '.join(best.source_domains[:3])
-    if len(best.source_domains) > 3:
-        domains_str += f" 等 {len(best.source_domains)} 个域名"
-    logger.info(f"  来源: {domains_str}")
-    logger.info(f"  丢包率: {best.packet_loss:.1f}%")
-    logger.info(f"  平均延迟: {best.avg_latency:.1f}ms")
-    logger.info(f"  最小延迟: {best.min_latency:.1f}ms")
-    logger.info(f"  最大延迟: {best.max_latency:.1f}ms")
-    logger.info(f"{'='*60}")
-
-    return best
 
 
 def update_he_dns(hostname: str, password: str, ip: str) -> bool:
@@ -1056,21 +848,21 @@ def main() -> int:
     logger.info(f"丢包率筛选阈值: {config.pkg_lost_threshold}%")
     logger.info(f"DNS 服务器: {', '.join(config.dns_servers)}")
 
-    # 检查速度测试配置
+    # 检查测试配置
     if not config.cfst_url:
         logger.error("配置文件缺少必填项: CFST_URL 未填写")
-        logger.error("CFST_URL 是进行速度测试所必需的测速地址")
+        logger.error("CFST_URL 是进行测试所必需的测速地址")
         logger.error(f"请编辑配置文件: {ENV_FILE}")
         return 1
 
-    logger.info(f"速度测试地址: {config.cfst_url}")
-    logger.info(f"速度测试 IP 数量: 前 {config.cfst_top_count} 个")
+    logger.info(f"测速地址: {config.cfst_url}")
+    logger.info(f"Ping 次数: {config.cfst_ping_count}")
 
     try:
         # 2. 检查/下载 cfst 工具
         cfst_path = ensure_cfst_tool(config)
         if not cfst_path:
-            logger.error("cfst 工具不可用，无法进行速度测试")
+            logger.error("cfst 工具不可用，无法进行测试")
             return 1
 
         # 3. 获取域名列表
@@ -1089,69 +881,48 @@ def main() -> int:
             logger.error("没有可解析的 IP")
             return 1
 
-        # 5. 选择最佳 IP
-        best_ip = None
-        best_speed = 0.0
-        source_domains = []
+        # 5. 使用 cfst 测试所有 IP
+        all_ips = list(ip_to_domains.keys())
+        results = run_speed_test(all_ips, ip_to_domains, config, cfst_path)
 
-        if config.skip_ping:
-            # 跳过 ping 测试，直接使用前 N 个 IP 进行速度测试
-            logger.info("跳过本地 ping 测试，直接使用解析到的 IP 进行速度测试...")
-            top_ips = list(ip_to_domains.keys())[:config.cfst_top_count]
+        if not results:
+            logger.error("测试未获得任何结果")
+            return 1
+
+        # 6. 选择最佳 IP：优先丢包率为 0，按速度排序
+        zero_loss_results = [r for r in results if r.packet_loss == 0 and r.success]
+
+        if zero_loss_results:
+            # 有丢包率为 0 的 IP，按速度排序
+            zero_loss_results.sort(key=lambda x: x.download_speed, reverse=True)
+            best = zero_loss_results[0]
+            logger.info(f"\n找到 {len(zero_loss_results)} 个丢包率为 0 的 IP")
         else:
-            # 对所有 IP 进行 ping 测试
-            results = test_all_ips(ip_to_domains, config.ping_count, config.ping_workers)
-
-            # 过滤成功的结果并按丢包率和延迟排序
+            # 没有丢包率为 0 的 IP，选择丢包率最低且速度最快的
+            logger.warning("没有丢包率为 0 的 IP，将选择丢包率最低的 IP")
             valid_results = [r for r in results if r.success]
             if not valid_results:
-                logger.error("没有可用的 IP（所有 IP ping 测试失败）")
+                logger.error("没有可用的 IP")
                 return 1
+            # 按丢包率升序，速度降序排序
+            valid_results.sort(key=lambda x: (x.packet_loss, -x.download_speed))
+            best = valid_results[0]
 
-            sorted_results = sorted(
-                valid_results,
-                key=lambda x: (x.packet_loss, x.avg_latency)
-            )
+        best_ip = best.ip
+        best_speed = best.download_speed
+        source_domains = best.source_domains
 
-            # 选取前 N 个 IP 进入速度测试
-            top_count = min(config.cfst_top_count, len(sorted_results))
-            top_results = sorted_results[:top_count]
-            top_ips = [r.ip for r in top_results]
-
-            logger.info(f"\n从 ping 测试结果中选取前 {len(top_ips)} 个 IP 进行速度测试:")
-            for i, r in enumerate(top_results, 1):
-                logger.info(f"  {i}. {r.ip}: 丢包率={r.packet_loss:.1f}%, 延迟={r.avg_latency:.1f}ms")
-
-        # 6. 进行速度测试
-        speed_results = run_speed_test(top_ips, config, cfst_path)
-
-        if speed_results and speed_results[0].success:
-            # 选择速度最快的 IP
-            best = speed_results[0]
-            best_ip = best.ip
-            best_speed = best.download_speed
-            source_domains = ip_to_domains.get(best_ip, [])
-
-            logger.info(f"\n{'='*60}")
-            logger.info(f"最佳 IP（速度最快）: {best_ip}")
-            domains_str = ', '.join(source_domains[:3])
-            if len(source_domains) > 3:
-                domains_str += f" 等 {len(source_domains)} 个域名"
-            logger.info(f"  来源: {domains_str}")
-            logger.info(f"  下载速度: {best_speed:.2f} MB/s")
-            logger.info(f"  平均延迟: {best.avg_latency:.1f}ms")
-            logger.info(f"{'='*60}")
-        else:
-            # 速度测试失败，回退到使用 ping 结果
-            logger.warning("速度测试未获得有效结果，将使用 ping 测试最佳 IP")
-            if top_ips:
-                best_ip = top_ips[0]
-                source_domains = ip_to_domains.get(best_ip, [])
-                logger.info(f"回退使用 IP: {best_ip}")
-
-        if not best_ip:
-            logger.error("没有可用的 IP")
-            return 1
+        # 输出最佳 IP 信息
+        logger.info(f"\n{'='*60}")
+        logger.info(f"最佳 IP: {best_ip}")
+        domains_str = ', '.join(source_domains[:3])
+        if len(source_domains) > 3:
+            domains_str += f" 等 {len(source_domains)} 个域名"
+        logger.info(f"  来源: {domains_str}")
+        logger.info(f"  丢包率: {best.packet_loss:.1f}%")
+        logger.info(f"  平均延迟: {best.avg_latency:.1f}ms")
+        logger.info(f"  下载速度: {best_speed:.2f} MB/s")
+        logger.info(f"{'='*60}")
 
         # 7. 更新 DNS 记录
         logger.info("")
@@ -1166,8 +937,8 @@ def main() -> int:
             print(f"  {config.hostname} -> {best_ip}")
             source = source_domains[0] if source_domains else "未知"
             print(f"  来源: {source}")
-            if best_speed > 0:
-                print(f"  下载速度: {best_speed:.2f} MB/s")
+            print(f"  丢包率: {best.packet_loss:.1f}%")
+            print(f"  下载速度: {best_speed:.2f} MB/s")
         else:
             print("  更新失败！")
             print("  请检查主机名和密钥是否正确")
