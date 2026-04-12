@@ -40,10 +40,12 @@ ENV_FILE = SCRIPT_DIR / '.env'
 ENV_TEMPLATE = """# HE.net DNS 自动更新工具配置文件
 # 请填写以下配置项后保存
 
-# [必填] dns.he.net 上要更新的主机名（如: cdn.example.com）
+# [必填] dns.he.net 上要更新的主机名，多个用逗号分隔
+# 例: cdn.example.com 或 cdn.example.com,web.example.com,api.example.com
 HE_HOSTNAME=
 
-# [必填] dns.he.net 动态 DNS 密钥
+# [必填] dns.he.net 动态 DNS 密钥，多个用逗号分隔（与主机名一一对应）
+# 如果所有主机名共用同一个密钥，只需填写一个即可
 HE_PASSWORD=
 
 # [可选] 获取域名列表的 API 地址（默认使用 vps789.com）
@@ -89,8 +91,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Config:
     """配置类"""
-    hostname: str
-    password: str
+    hostnames: list[str] = field(default_factory=list)
+    passwords: list[str] = field(default_factory=list)
     api_url: str = "https://vps789.com/public/sum/cfIpTop20"
     pkg_lost_threshold: float = 0.5
     dns_servers: list[str] = field(default_factory=lambda: ['119.29.29.29', '223.5.5.5'])
@@ -189,17 +191,29 @@ def load_config() -> Optional[Config]:
     env_vars = load_env_file(ENV_FILE)
 
     # 检查必填项
-    hostname = env_vars.get('HE_HOSTNAME', '').strip()
-    password = env_vars.get('HE_PASSWORD', '').strip()
+    hostname_str = env_vars.get('HE_HOSTNAME', '').strip()
+    password_str = env_vars.get('HE_PASSWORD', '').strip()
 
-    if not hostname:
+    if not hostname_str:
         logger.error("配置文件缺少必填项: HE_HOSTNAME 未填写")
         logger.error(f"请编辑配置文件: {ENV_FILE}")
         return None
 
-    if not password:
+    if not password_str:
         logger.error("配置文件缺少必填项: HE_PASSWORD 未填写")
         logger.error(f"请编辑配置文件: {ENV_FILE}")
+        return None
+
+    # 解析多域名和密钥
+    hostnames = [h.strip() for h in hostname_str.split(',') if h.strip()]
+    passwords = [p.strip() for p in password_str.split(',') if p.strip()]
+
+    # 如果只有一个密钥但多个主机名，所有主机名共用同一个密钥
+    if len(passwords) == 1 and len(hostnames) > 1:
+        passwords = passwords * len(hostnames)
+    elif len(passwords) != len(hostnames):
+        logger.error(f"主机名数量({len(hostnames)})与密钥数量({len(passwords)})不匹配")
+        logger.error("请确保每个主机名都有对应的密钥，或所有主机名共用一个密钥")
         return None
 
     # 解析可选配置
@@ -234,8 +248,8 @@ def load_config() -> Optional[Config]:
     dns_servers = parse_list(dns_servers_str, ['119.29.29.29', '223.5.5.5'])
 
     config = Config(
-        hostname=hostname,
-        password=password,
+        hostnames=hostnames,
+        passwords=passwords,
         api_url=env_vars.get('API_URL', '').strip() or "https://vps789.com/public/sum/cfIpTop20",
         pkg_lost_threshold=parse_float(env_vars.get('PKG_LOST_THRESHOLD', ''), 0.5),
         dns_servers=dns_servers,
@@ -844,7 +858,7 @@ def main() -> int:
         logging.getLogger().setLevel(logging.DEBUG)
         logger.debug("调试模式已启用")
 
-    logger.info(f"目标主机名: {config.hostname}")
+    logger.info(f"目标主机名: {', '.join(config.hostnames)}")
     logger.info(f"丢包率筛选阈值: {config.pkg_lost_threshold}%")
     logger.info(f"DNS 服务器: {', '.join(config.dns_servers)}")
 
@@ -924,27 +938,39 @@ def main() -> int:
         logger.info(f"  下载速度: {best_speed:.2f} MB/s")
         logger.info(f"{'='*60}")
 
-        # 7. 更新 DNS 记录
+        # 7. 更新 DNS 记录（支持多域名）
         logger.info("")
-        success = update_he_dns(config.hostname, config.password, best_ip)
+        success_count = 0
+        fail_count = 0
+        update_results = []
+
+        for hostname, password in zip(config.hostnames, config.passwords):
+            ok = update_he_dns(hostname, password, best_ip)
+            update_results.append((hostname, ok))
+            if ok:
+                success_count += 1
+            else:
+                fail_count += 1
 
         # 8. 输出结果
         print()
         print("=" * 60)
-        if success:
-            print("  更新完成！")
+        if success_count > 0:
+            print(f"  更新完成！成功: {success_count}, 失败: {fail_count}")
             print()
-            print(f"  {config.hostname} -> {best_ip}")
+            for hostname, ok in update_results:
+                status = "✓" if ok else "✗"
+                print(f"  {status} {hostname} -> {best_ip}")
             source = source_domains[0] if source_domains else "未知"
-            print(f"  来源: {source}")
+            print(f"\n  来源: {source}")
             print(f"  丢包率: {best.packet_loss:.1f}%")
             print(f"  下载速度: {best_speed:.2f} MB/s")
         else:
-            print("  更新失败！")
+            print("  全部更新失败！")
             print("  请检查主机名和密钥是否正确")
         print("=" * 60)
 
-        return 0 if success else 1
+        return 0 if fail_count == 0 else 1
 
     except KeyboardInterrupt:
         logger.info("\n用户中断")
